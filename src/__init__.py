@@ -20,6 +20,17 @@ from .conv1d_optimized import (
     Conv1dLayerOptimized,
 )
 
+from .reference_encoder_optimized import (
+    ReferenceEncoderOptimized,
+    get_ref_encoder_weights,
+)
+
+from .duration_predictor_optimized import (
+    DurationPredictorOptimized,
+    ttnn_layernorm,
+    get_duration_predictor_weights,
+)
+
 from .ops import (
     ttnn_sequence_mask,
     ttnn_generate_path,
@@ -34,6 +45,13 @@ __all__ = [
     "ttnn_conv1d_optimized",
     "ttnn_conv_transpose1d_optimized",
     "Conv1dLayerOptimized",
+    # Reference Encoder
+    "ReferenceEncoderOptimized",
+    "get_ref_encoder_weights",
+    # Duration Predictor
+    "DurationPredictorOptimized",
+    "ttnn_layernorm",
+    "get_duration_predictor_weights",
     # Alignment
     "ttnn_sequence_mask",
     "ttnn_generate_path",
