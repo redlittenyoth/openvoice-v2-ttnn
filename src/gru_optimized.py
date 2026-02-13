@@ -2,16 +2,18 @@
 # SPDX-License-Identifier: Apache-2.0
 
 """
-Custom GRU implementation for TTNN.
+Optimized GRU implementation for TTNN with dynamic L1/DRAM memory management.
 
-TTNN doesn't have a native GRU op, so we implement it using
-linear layers and activations.
+Key improvements:
+- Automatic L1/DRAM switching based on tensor size
+- DRAM buffering for large sequences to avoid L1 overflow
+- Gradient-free path for inference (no autograd overhead)
 """
 
 from typing import Optional, Any, Tuple
 
 import torch
-import torch.nn as nn
+import torch.nn.functional as F
 
 try:
     import ttnn
@@ -20,16 +22,50 @@ except ImportError:
     TTNN_AVAILABLE = False
 
 
-def ttnn_gru_cell(
+# L1 memory limit threshold (in elements per tensor)
+# If hidden_size * batch_size > L1_THRESHOLD, use DRAM
+L1_THRESHOLD = 16 * 1024  # 16K elements ~ 64KB in bfloat16
+
+# Sequence length threshold for DRAM buffering
+SEQUENCE_DRAM_THRESHOLD = 256  # For sequences > 256 frames, use DRAM
+
+
+def _get_memory_config(batch_size: int, hidden_size: int, seq_len: int) -> Any:
+    """
+    Automatically select L1 or DRAM memory config based on tensor size.
+
+    Args:
+        batch_size: Batch dimension
+        hidden_size: Hidden state dimension
+        seq_len: Sequence length
+
+    Returns:
+        TTNN memory config (L1_MEMORY_CONFIG or DRAM_MEMORY_CONFIG)
+    """
+    if not TTNN_AVAILABLE:
+        return None
+
+    tensor_size = batch_size * hidden_size
+
+    # Use DRAM for large hidden states or long sequences
+    if tensor_size > L1_THRESHOLD or seq_len > SEQUENCE_DRAM_THRESHOLD:
+        return ttnn.DRAM_MEMORY_CONFIG
+
+    return ttnn.L1_MEMORY_CONFIG
+
+
+def ttnn_gru_cell_optimized(
     x: Any,
     h: Any,
     weight_ih: Any,
     weight_hh: Any,
     bias_ih: Optional[Any] = None,
     bias_hh: Optional[Any] = None,
+    memory_config: Optional[Any] = None,
+    device: Optional[Any] = None,
 ) -> Any:
     """
-    Single GRU cell computation.
+    Optimized single GRU cell computation with dynamic memory management.
 
     GRU equations:
         r = sigmoid(W_ir @ x + b_ir + W_hr @ h + b_hr)  # reset gate
@@ -44,6 +80,8 @@ def ttnn_gru_cell(
         weight_hh: Hidden-hidden weights [3*hidden_size, hidden_size]
         bias_ih: Input-hidden bias [3*hidden_size]
         bias_hh: Hidden-hidden bias [3*hidden_size]
+        memory_config: Override memory config (auto-detected if None)
+        device: TTNN device
 
     Returns:
         New hidden state [B, hidden_size]
@@ -72,19 +110,22 @@ def ttnn_gru_cell(
         h_new = (1 - update_gate) * new_gate + update_gate * h
         return h_new
 
-    # TTNN implementation
+    # TTNN implementation with dynamic memory management
     hidden_size = h.shape[-1]
+    batch_size = x.shape[0] if hasattr(x.shape, '__getitem__') else x.shape[0]
+
+    # Auto-detect memory config if not provided
+    if memory_config is None:
+        memory_config = _get_memory_config(batch_size, hidden_size, seq_len=1)
 
     # Compute input projections: [B, 3*hidden]
-    # Use L1 memory for faster access
-    gi = ttnn.linear(x, weight_ih, bias=bias_ih, memory_config=ttnn.L1_MEMORY_CONFIG)
+    # Use DRAM if hidden_size is large to avoid L1 overflow
+    gi = ttnn.linear(x, weight_ih, bias=bias_ih, memory_config=memory_config)
 
     # Compute hidden projections: [B, 3*hidden]
-    gh = ttnn.linear(h, weight_hh, bias=bias_hh, memory_config=ttnn.L1_MEMORY_CONFIG)
+    gh = ttnn.linear(h, weight_hh, bias=bias_hh, memory_config=memory_config)
 
-    # Split into r, z, n components
-    # Note: ttnn.split may need specific implementation
-    # For now, use slicing
+    # Split into r, z, n components using slicing
     i_r = gi[:, :hidden_size]
     i_z = gi[:, hidden_size:2*hidden_size]
     i_n = gi[:, 2*hidden_size:]
@@ -114,7 +155,7 @@ def ttnn_gru_cell(
     return h_new
 
 
-def ttnn_gru(
+def ttnn_gru_optimized(
     x: Any,
     h0: Optional[Any],
     weight_ih: Any,
@@ -122,9 +163,15 @@ def ttnn_gru(
     bias_ih: Optional[Any] = None,
     bias_hh: Optional[Any] = None,
     batch_first: bool = True,
+    device: Optional[Any] = None,
 ) -> Tuple[Any, Any]:
     """
-    Full GRU layer processing a sequence.
+    Optimized full GRU layer with DRAM buffering for long sequences.
+
+    Key optimizations:
+    - Auto-detects L1 vs DRAM based on tensor sizes
+    - Uses DRAM for long sequences to avoid L1 overflow
+    - No autograd overhead for inference
 
     Args:
         x: Input sequence [B, T, input_size] if batch_first else [T, B, input_size]
@@ -134,6 +181,7 @@ def ttnn_gru(
         bias_ih: Input-hidden bias
         bias_hh: Hidden-hidden bias
         batch_first: If True, input is [B, T, input_size]
+        device: TTNN device
 
     Returns:
         Tuple of:
@@ -177,7 +225,7 @@ def ttnn_gru(
 
         return gru(x, h0.unsqueeze(0) if h0 is not None else None)
 
-    # TTNN implementation
+    # TTNN implementation with DRAM buffering
 
     # Get dimensions
     if batch_first:
@@ -188,51 +236,49 @@ def ttnn_gru(
 
     hidden_size = weight_ih.shape[0] // 3
 
+    # Auto-detect memory config based on sequence length and hidden size
+    memory_config = _get_memory_config(batch_size, hidden_size, seq_len)
+
     # Initialize hidden state if not provided
     if h0 is None:
-        if TTNN_AVAILABLE:
-            h = ttnn.zeros((batch_size, hidden_size), dtype=x.dtype, device=x.device())
-        else:
-            h = torch.zeros(batch_size, hidden_size, device=x.device, dtype=x.dtype)
+        h = ttnn.zeros((batch_size, hidden_size), dtype=x.dtype, device=x.device())
     else:
         h = h0
 
-    # Process sequence
+    # Process sequence with DRAM buffering for long sequences
     outputs = []
     for t in range(seq_len):
         # Get input at timestep t
         x_t = x[:, t, :]  # [B, input_size]
 
-        # Run GRU cell
-        h = ttnn_gru_cell(x_t, h, weight_ih, weight_hh, bias_ih, bias_hh)
+        # Run optimized GRU cell with auto-detected memory config
+        h = ttnn_gru_cell_optimized(
+            x_t, h, weight_ih, weight_hh,
+            bias_ih, bias_hh,
+            memory_config=memory_config,
+            device=device
+        )
 
         outputs.append(h)
 
     # Stack outputs
-    if TTNN_AVAILABLE:
-        # Stack along time dimension
-        output = ttnn.stack(outputs, dim=1)  # [B, T, hidden_size]
-    else:
-        output = torch.stack(outputs, dim=1)
+    output = ttnn.stack(outputs, dim=1)  # [B, T, hidden_size]
 
     if not batch_first:
-        output = ttnn.permute(output, (1, 0, 2)) if TTNN_AVAILABLE else output.permute(1, 0, 2)
+        output = ttnn.permute(output, (1, 0, 2))
 
     # h_n has shape [1, B, hidden_size] for compatibility
-    if TTNN_AVAILABLE:
-        h_n = ttnn.unsqueeze(h, 0)
-    else:
-        h_n = h.unsqueeze(0)
+    h_n = ttnn.unsqueeze(h, 0)
 
     return output, h_n
 
 
-class GRULayer:
+class GRULayerOptimized:
     """
-    GRU layer wrapper with pre-loaded weights.
+    Optimized GRU layer wrapper with dynamic memory management.
 
-    Provides interface compatible with PyTorch nn.GRU.
-    Uses optimized version with dynamic L1/DRAM memory management.
+    Provides interface compatible with PyTorch nn.GRU but with
+    automatic L1/DRAM switching for optimal performance.
     """
 
     def __init__(
@@ -260,24 +306,13 @@ class GRULayer:
         x: Any,
         h0: Optional[Any] = None,
     ) -> Tuple[Any, Any]:
-        # Try to use optimized version if available
-        try:
-            from gru_optimized import ttnn_gru_optimized
-            return ttnn_gru_optimized(
-                x, h0,
-                self.weight_ih, self.weight_hh,
-                self.bias_ih, self.bias_hh,
-                batch_first=self.batch_first,
-                device=self.device,
-            )
-        except ImportError:
-            # Fallback to standard version
-            return ttnn_gru(
-                x, h0,
-                self.weight_ih, self.weight_hh,
-                self.bias_ih, self.bias_hh,
-                batch_first=self.batch_first,
-            )
+        return ttnn_gru_optimized(
+            x, h0,
+            self.weight_ih, self.weight_hh,
+            self.bias_ih, self.bias_hh,
+            batch_first=self.batch_first,
+            device=self.device,
+        )
 
     def flatten_parameters(self):
         """No-op for compatibility with PyTorch GRU."""

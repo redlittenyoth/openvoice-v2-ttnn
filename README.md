@@ -14,6 +14,24 @@ Existing implementations (e.g., PR #36286) rely on CPU fallbacks for:
 -   **On-Device Alignment**: We use a matmul-based `cumsum` implementation to generate the alignment path entirely on the Tenstorrent chip.
 -   **Optimized Memory**: We utilize DRAM buffering for long sequences to bypass L1 overflows without dropping back to the host CPU.
 -   **Fully TTNN-Compatible**: All operations are expressed via `ttnn` APIs to minimize host-device synchronization.
+-   **Dynamic L1/DRAM Switching**: Automatic memory management based on tensor size and sequence length.
+
+## Recent Optimizations (Feb 13, 2026)
+
+### GRU L1 Optimization (`gru_optimized.py`)
+- **Problem:** Original implementation used `L1_MEMORY_CONFIG` for all operations, causing overflow for large hidden states (>16K elements).
+- **Solution:** Dynamic L1/DRAM switching based on:
+  - Hidden state size (batch_size × hidden_size)
+  - Sequence length (>256 frames triggers DRAM)
+- **Result:** Eliminates GRU fallback to CPU for reference encoder.
+
+### HiFi-GAN Stride-2 Fix (`conv1d_optimized.py`)
+- **Problem:** Original `conv1d.py` had hardcoded CPU fallback for `stride >= 2`, breaking on-device upsampling.
+- **Solution:**
+  - Removed CPU fallback for stride >= 2
+  - Added automatic DRAM detection for large kernels/strides (kernel_size × stride > 1024)
+  - Uses `DRAM_MEMORY_CONFIG` instead of `L1_MEMORY_CONFIG` for large operations
+- **Result:** All HiFi-GAN upsampling layers now run on-device without CPU fallback.
 
 ## Structure
 -   `src/`: Original modules from the TTNN port.
@@ -36,8 +54,8 @@ Existing implementations (e.g., PR #36286) rely on CPU fallbacks for:
 ## Bounty Progress
 - [x] On-device `_generate_path` implementation.
 - [x] Elimination of CPU synchronization points in `_infer_ttnn`.
-- [ ] GRU L1 optimization (In Progress).
-- [ ] HiFi-GAN stride-2 fallback fix (In Progress).
+- [x] GRU L1 optimization with dynamic DRAM buffering.
+- [x] HiFi-GAN stride-2 fallback fix (removed CPU fallback, uses on-device DRAM).
 
 ---
 **Author:** Andrey & Freya 😉

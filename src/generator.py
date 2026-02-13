@@ -19,7 +19,7 @@ try:
 except ImportError:
     TTNN_AVAILABLE = False
 
-from models.demos.openvoice.tt.modules.conv1d import ttnn_conv1d, ttnn_conv_transpose1d
+from conv1d_optimized import ttnn_conv1d_optimized as ttnn_conv1d, ttnn_conv_transpose1d_optimized as ttnn_conv_transpose1d
 
 # Leaky ReLU slope used in HiFi-GAN
 LRELU_SLOPE = 0.1
