@@ -1,5 +1,7 @@
 # OpenVoice V2 TTNN Full On-Device (Bounty $1,500)
 
+[![GitHub](https://img.shields.io/badge/GitHub-redlittenyoth%2Fopenvoice--v2--ttnn-brightgreen)](https://github.com/redlittenyoth/openvoice-v2-ttnn)
+
 This project implements a **100% on-device** inference pipeline for OpenVoice V2 on Tenstorrent hardware.
 
 ## The Problem
